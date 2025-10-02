@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 )
@@ -4275,4 +4276,182 @@ func (c *Client) RemoveTweetBookmark(ctx context.Context, userID, tweetID string
 	respBody.RateLimit = rl
 
 	return respBody, nil
+}
+
+// UploadMedia uploads media files for use in tweets using the chunked upload API
+func (c *Client) UploadMedia(ctx context.Context, req MediaUploadRequest) (*MediaUploadResponse, error) {
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
+
+	// Step 1: INIT - Initialize the upload
+	initResp, err := c.mediaUploadInit(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("media upload init failed: %w", err)
+	}
+
+	// Step 2: APPEND - Upload the media in chunks
+	const chunkSize = 4 * 1024 * 1024 // 4MB chunks
+	mediaData := req.Media
+	segmentIndex := 0
+
+	for i := 0; i < len(mediaData); i += chunkSize {
+		end := i + chunkSize
+		if end > len(mediaData) {
+			end = len(mediaData)
+		}
+		chunk := mediaData[i:end]
+
+		err := c.mediaUploadAppend(ctx, initResp.MediaIDString, segmentIndex, chunk)
+		if err != nil {
+			return nil, fmt.Errorf("media upload append failed: %w", err)
+		}
+		segmentIndex++
+	}
+
+	// Step 3: FINALIZE - Complete the upload
+	finalResp, err := c.mediaUploadFinalize(ctx, initResp.MediaIDString)
+	if err != nil {
+		return nil, fmt.Errorf("media upload finalize failed: %w", err)
+	}
+
+	return finalResp, nil
+}
+
+// mediaUploadInit initializes a media upload session
+func (c *Client) mediaUploadInit(ctx context.Context, req MediaUploadRequest) (*MediaUploadInitResponse, error) {
+	// Use application/x-www-form-urlencoded format
+	formData := fmt.Sprintf("command=INIT&media_type=%s&total_bytes=%d&media_category=%s",
+		req.MediaType, int64(len(req.Media)), string(req.MediaCategory))
+
+	ep := mediaUploadEndpoint.url(c.Host)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ep, strings.NewReader(formData))
+	if err != nil {
+		return nil, fmt.Errorf("media upload init request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Authorizer.Add(httpReq)
+
+	resp, err := c.Client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("media upload init response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("media upload init failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Debug: log the raw response
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read init response: %w", err)
+	}
+	fmt.Printf("DEBUG: Media upload INIT response: %s\n", string(respBodyBytes))
+
+	var initResp MediaUploadInitResponse
+	if err := json.Unmarshal(respBodyBytes, &initResp); err != nil {
+		return nil, fmt.Errorf("failed to decode init response: %w", err)
+	}
+
+	return &initResp, nil
+}
+
+// mediaUploadAppend uploads a chunk of media data
+func (c *Client) mediaUploadAppend(ctx context.Context, mediaID string, segmentIndex int, data []byte) error {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// Add command
+	writer.WriteField("command", "APPEND")
+	writer.WriteField("media_id", mediaID)
+	writer.WriteField("segment_index", fmt.Sprintf("%d", segmentIndex))
+
+	// Add media data
+	mediaWriter, err := writer.CreateFormFile("media", "chunk")
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := mediaWriter.Write(data); err != nil {
+		return fmt.Errorf("failed to write media data: %w", err)
+	}
+
+	writer.Close()
+
+	ep := mediaUploadEndpoint.url(c.Host)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ep, &buf)
+	if err != nil {
+		return fmt.Errorf("media upload append request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+	c.Authorizer.Add(httpReq)
+
+	resp, err := c.Client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("media upload append response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("media upload append failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// mediaUploadFinalize completes the media upload
+func (c *Client) mediaUploadFinalize(ctx context.Context, mediaID string) (*MediaUploadResponse, error) {
+	// Use application/x-www-form-urlencoded format
+	formData := fmt.Sprintf("command=FINALIZE&media_id=%s", mediaID)
+
+	ep := mediaUploadEndpoint.url(c.Host)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ep, strings.NewReader(formData))
+	if err != nil {
+		return nil, fmt.Errorf("media upload finalize request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	c.Authorizer.Add(httpReq)
+
+	resp, err := c.Client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("media upload finalize response: %w", err)
+	}
+	defer resp.Body.Close()
+
+	rl := rateFromHeader(resp.Header)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("media upload finalize failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read and parse the response
+	respBodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, &ResponseDecodeError{
+			Name:      "media upload finalize body read",
+			Err:       err,
+			RateLimit: rl,
+		}
+	}
+
+	// Debug: log the raw response
+	fmt.Printf("DEBUG: Media upload FINALIZE response: %s\n", string(respBodyBytes))
+
+	var uploadResp MediaUploadResponse
+	if err := json.Unmarshal(respBodyBytes, &uploadResp); err != nil {
+		return nil, &ResponseDecodeError{
+			Name:      "media upload finalize",
+			Err:       err,
+			RateLimit: rl,
+		}
+	}
+	uploadResp.RateLimit = rl
+	return &uploadResp, nil
 }
